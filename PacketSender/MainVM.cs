@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
 using Newtonsoft.Json;
@@ -14,10 +15,21 @@ namespace PacketSender
     public class MainVM : NotifyPropertyChanged
     {
         private string _configParameterFilePath = "DefaultParameter.json";
-
+        private CancellationTokenSource _cts = new CancellationTokenSource();
+        private TcpListener _tcpServer;
+        private PacketSenderParameterModel _parameterModel = new PacketSenderParameterModel();
         private bool _isListening = false;
 
-        private PacketSenderParameterModel _parameterModel = new PacketSenderParameterModel();
+        public bool IsListening
+        {
+            get => _isListening;
+            set
+            {
+                _isListening = value;
+                OnPropertyChanged();
+            }
+        }
+
         public PacketSenderParameterModel ParameterModel
         {
             get => _parameterModel;
@@ -34,12 +46,15 @@ namespace PacketSender
         {
             StartListenCommand = new RelayCommand(StartListen);
             ClearLogCommand = new RelayCommand(ClearLog);
+            ClearAllConnCommand = new RelayCommand(ClearAllConnection);
             LoadDefaultParamter();
         }
 
         public ICommand StartListenCommand { get; }
 
         public ICommand ClearLogCommand { get; }
+
+        public ICommand ClearAllConnCommand { get; }
 
         private void LoadDefaultParamter()
         {
@@ -80,75 +95,97 @@ namespace PacketSender
 
         private async void StartListen(object para)
         {
-            int tcpPort = 12306;
-            if (_isListening)
+            try
             {
-                AddLog(LogLevel.Info, $"TCP listener started on port {tcpPort}", LogDestination.DispalyAndLogFile);
-                return;
-            }
+                int tcpPort = 12306;
+                if (IsListening)
+                {
+                    AddLog(LogLevel.Info, $"TCP listener started on port {tcpPort}", LogDestination.DispalyAndLogFile);
+                    return;
+                }
 
-            TcpListener tcpListener = new TcpListener(IPAddress.Parse(_parameterModel.TcpListenerIp), tcpPort);
-            tcpListener.Start();
-            AddLog(LogLevel.Info, $"TCP listener started on port {tcpPort}", LogDestination.DispalyAndLogFile);
-            _isListening = true;
-            while (true)
+                _tcpServer = new TcpListener(IPAddress.Parse(_parameterModel.TcpListenerIp), tcpPort);
+                _tcpServer.Start();
+                AddLog(LogLevel.Info, $"TCP listener started on port {tcpPort}", LogDestination.DispalyAndLogFile);
+                IsListening = true;
+                _cts?.Token.ThrowIfCancellationRequested();
+
+                // wait for a TCP client connection
+                TcpClient tcpClient = await _tcpServer.AcceptTcpClientAsync();
+                var lep = tcpClient.Client.RemoteEndPoint as IPEndPoint;
+                AddLog(LogLevel.Warning, $"[{lep.Address}:{lep.Port}] request connection", LogDestination.DispalyAndLogFile);
+                AddLog(LogLevel.Warning, $"{lep.Address}:{lep.Port}] connected", LogDestination.DispalyAndLogFile);
+                await HandleTcpClientAsync(tcpClient, _parameterModel.TargetUdpIp, _parameterModel.TargetUdpPort);
+            }
+            catch (Exception ex)
             {
-                TcpClient tcpClient = await tcpListener.AcceptTcpClientAsync();
-                AddLog(LogLevel.Info, "TCP client connected", LogDestination.DispalyAndLogFile);
-                _ = HandleTcpClientAsync(tcpClient, _parameterModel.TargetUdpIp, _parameterModel.TargetUdpPort);
+                AddLog(LogLevel.Info, $"[{_parameterModel.TcpListenerIp}] {ex.Message}", LogDestination.DispalyAndLogFile);
+                ClearAllConnection(null);
             }
         }
 
         async Task HandleTcpClientAsync(TcpClient tcpClient, string udpTargetIp, int udpTargetPort)
         {
-            NetworkStream networkStream = tcpClient.GetStream();
-            byte[] buffer = new byte[1024];
-            int bytesRead;
-
-            while ((bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length)) != 0)
+            try
             {
-                string message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                AddLog(LogLevel.Info, $"Received message: {message}", LogDestination.DispalyAndLogFile);
-                var cmdInfo = message.Trim();
-                if (string.IsNullOrEmpty(cmdInfo))
-                {
-                    AddLog(LogLevel.Error, "Invalid command", LogDestination.DispalyAndLogFile);
-                    continue;
-                }
-                var cmdInfoArr = cmdInfo.Split('#');
-                if (cmdInfoArr.Length != 2)
-                {
-                    AddLog(LogLevel.Error, "Invalid command", LogDestination.DispalyAndLogFile);
-                    continue;
-                }
 
-                if (cmdInfoArr[0].Equals(PacketSenderCommandType.SendPacket, StringComparison.OrdinalIgnoreCase))
+                NetworkStream networkStream = tcpClient.GetStream();
+                byte[] buffer = new byte[1024];
+                int bytesRead;
+
+                while ((bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length)) != 0)
                 {
-                    await SendUdpPacketsAsync(udpTargetIp, udpTargetPort);
-                    string response = PacketSenderCommandType.SendPacket + "#OK";
-                    byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-                    await networkStream.WriteAsync(responseBytes, 0, responseBytes.Length);
-                    AddLog(LogLevel.Info, "Sent response to TCP client", LogDestination.DispalyAndLogFile);
-                }
-                else if (cmdInfoArr[0].Equals(PacketSenderCommandType.SetPacketCount, StringComparison.OrdinalIgnoreCase))
-                {
-                    var configModel = JsonConvert.DeserializeObject<ConfigModel>(cmdInfoArr[1]);
-                    if (configModel == null)
+                    _cts?.Token.ThrowIfCancellationRequested();
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    AddLog(LogLevel.Info, $"Received message: {message}", LogDestination.DispalyAndLogFile);
+                    var cmdInfo = message.Trim();
+                    if (string.IsNullOrEmpty(cmdInfo))
+                    {
+                        AddLog(LogLevel.Error, "Invalid command", LogDestination.DispalyAndLogFile);
+                        continue;
+                    }
+                    var cmdInfoArr = cmdInfo.Split('#');
+                    if (cmdInfoArr.Length != 2)
                     {
                         AddLog(LogLevel.Error, "Invalid command", LogDestination.DispalyAndLogFile);
                         continue;
                     }
 
-                    _parameterModel.PacketCount = configModel.PacketCount;
-                    string response = PacketSenderCommandType.SetPacketCount + "#OK";
-                    byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-                    await networkStream.WriteAsync(responseBytes, 0, responseBytes.Length);
-                    AddLog(LogLevel.Info, "Sent response to TCP client", LogDestination.DispalyAndLogFile);
-                }
-            }
+                    if (cmdInfoArr[0].Equals(PacketSenderCommandType.SendPacket, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await SendUdpPacketsAsync(udpTargetIp, udpTargetPort);
+                        string response = PacketSenderCommandType.SendPacket + "#OK";
+                        byte[] responseBytes = Encoding.UTF8.GetBytes(response);
+                        await networkStream.WriteAsync(responseBytes, 0, responseBytes.Length);
+                        AddLog(LogLevel.Info, "Sent response to TCP client", LogDestination.DispalyAndLogFile);
+                    }
+                    else if (cmdInfoArr[0].Equals(PacketSenderCommandType.SetPacketCount, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var configModel = JsonConvert.DeserializeObject<ConfigModel>(cmdInfoArr[1]);
+                        if (configModel == null)
+                        {
+                            AddLog(LogLevel.Error, "Invalid command", LogDestination.DispalyAndLogFile);
+                            continue;
+                        }
 
-            tcpClient.Close();
-            AddLog(LogLevel.Info, "TCP client disconnected", LogDestination.DispalyAndLogFile);
+                        _parameterModel.PacketCount = configModel.PacketCount;
+                        string response = PacketSenderCommandType.SetPacketCount + "#OK";
+                        byte[] responseBytes = Encoding.UTF8.GetBytes(response);
+                        await networkStream.WriteAsync(responseBytes, 0, responseBytes.Length);
+                        AddLog(LogLevel.Info, "Sent response to TCP client", LogDestination.DispalyAndLogFile);
+                    }
+                }
+
+                tcpClient.Close();
+                AddLog(LogLevel.Warning, "TCP client disconnected", LogDestination.DispalyAndLogFile);
+                ClearAllConnection(null);
+            }
+            catch (Exception ex)
+            {
+                var lep = tcpClient.Client.RemoteEndPoint as IPEndPoint;
+                AddLog(LogLevel.Info, $"[{lep.Address}:{lep.Port}] {ex.Message}", LogDestination.DispalyAndLogFile);
+                ClearAllConnection(null);
+            }
         }
 
         async Task SendUdpPacketsAsync(string ipAddress, int port)
@@ -207,6 +244,17 @@ namespace PacketSender
         {
             LogItemList.Clear();
         }
+
+        public void ClearAllConnection(object para)
+        {
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            _tcpServer?.Stop();
+            IsListening = false;
+            _tcpServer = null;
+            AddLog(LogLevel.Info, "All connection cleared", LogDestination.DispalyAndLogFile);
+        }
+
         private void AddLog(LogLevel logLevel, string message, LogDestination destination)
         {
             switch (destination)
